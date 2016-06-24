@@ -6,8 +6,10 @@
 extern "C" {
 #endif
 
-// Protect all access to `finalizer_list`, `finalizer_list_marked` and
-// `to_finalize`.
+// Protect all access to `finalizer_list_marked` and `to_finalize`.
+// For accessing `ptls->finalizers`, the lock is needed if a thread is
+// is going to realloc the buffer (of it's own list) or accessing the
+// list of another thread
 static jl_mutex_t finalizers_lock;
 
 /**
@@ -51,11 +53,10 @@ region_t regions[REGION_COUNT];
 bigval_t *big_objects_marked = NULL;
 
 // finalization
-// `finalizer_list` and `finalizer_list_marked` might have tagged pointers.
+// `ptls->finalizers` and `finalizer_list_marked` might have tagged pointers.
 // If an object pointer has the lowest bit set, the next pointer is an unboxed
 // c function pointer.
 // `to_finalize` should not have tagged pointers.
-arraylist_t finalizer_list;
 arraylist_t finalizer_list_marked;
 arraylist_t to_finalize;
 
@@ -113,19 +114,21 @@ static void run_finalizer(jl_value_t *o, jl_value_t *ff)
     }
 }
 
+// if `need_sync` is true, the `list` is the `finalizers` list of another
+// thead and we need additional synchronizations
 static void finalize_object(arraylist_t *list, jl_value_t *o,
-                            arraylist_t *copied_list)
+                            arraylist_t *copied_list, int need_sync)
 {
-    for (int i = 0; i < list->len; i+=2) {
-        void *v = list->items[i];
+    // The acquire load makes sure that the first `len` objects are valid
+    size_t len = need_sync ? jl_atomic_load_acquire(&list->len) : list->len;
+    size_t oldlen = len;
+    void **items = list->items;
+    for (size_t i = 0; i < len; i += 2) {
+        void *v = items[i];
+        int move = 0;
         if (o == (jl_value_t*)gc_ptr_clear_tag(v, 1)) {
-            void *f = list->items[i + 1];
-            if (i < list->len - 2) {
-                list->items[i] = list->items[list->len-2];
-                list->items[i+1] = list->items[list->len-1];
-                i -= 2;
-            }
-            list->len -= 2;
+            void *f = items[i + 1];
+            move = 1;
             if (gc_ptr_tag(v, 1)) {
                 ((void (*)(void*))f)(v);
             }
@@ -134,6 +137,25 @@ static void finalize_object(arraylist_t *list, jl_value_t *o,
                 arraylist_push(copied_list, f);
             }
         }
+        if (move || __unlikely(!v)) {
+            if (i < len - 2) {
+                items[i] = items[len - 2];
+                items[i + 1] = items[len - 1];
+                i -= 2;
+            }
+            len -= 2;
+        }
+    }
+    if (oldlen != len)
+        return;
+    if (need_sync) {
+        if (__unlikely(jl_atomic_compare_exchange(&list->len,
+                                                  oldlen, len) != oldlen)) {
+            memset(items[len], 0, (oldlen - len) * sizeof(void*));
+        }
+    }
+    else {
+        list->len = len;
     }
 }
 
@@ -201,6 +223,8 @@ static void schedule_all_finalizers(arraylist_t *flist)
     for(size_t i=0; i < flist->len; i+=2) {
         void *v = flist->items[i];
         void *f = flist->items[i + 1];
+        if (__unlikely(!v))
+            continue;
         if (!gc_ptr_tag(v, 1)) {
             schedule_finalization(v, f);
         }
@@ -210,41 +234,64 @@ static void schedule_all_finalizers(arraylist_t *flist)
 
 void jl_gc_run_all_finalizers(void)
 {
-    JL_LOCK_NOGC(&finalizers_lock);
-    schedule_all_finalizers(&finalizer_list);
+    for (int i = 0;i < jl_n_threads;i++) {
+        jl_tls_states_t *ptls2 = jl_all_tls_states[i];
+        schedule_all_finalizers(&ptls2->finalizers);
+    }
     schedule_all_finalizers(&finalizer_list_marked);
-    JL_UNLOCK_NOGC(&finalizers_lock);
     run_finalizers();
 }
 
-static void gc_add_ptr_finalizer(jl_value_t *v, void *f)
+static void gc_add_finalizer_(jl_tls_states_t *ptls, void *v, void *f)
 {
-    arraylist_push(&finalizer_list, (void*)(((uintptr_t)v) | 1));
-    arraylist_push(&finalizer_list, f);
+    int8_t gc_state = jl_gc_unsafe_enter(ptls);
+    arraylist_t *a = &ptls->finalizers;
+    size_t oldlen = jl_atomic_load_acquire(&a->len);
+    if (__unlikely(oldlen + 2 > a->max)) {
+        JL_LOCK_NOGC(&finalizers_lock);
+        arraylist_grow(a, 2);
+        a->len = oldlen;
+        JL_UNLOCK_NOGC(&finalizers_lock);
+    }
+    void **items = a->items;
+    items[oldlen] = v;
+    items[oldlen + 1] = f;
+    jl_atomic_store_release(&a->len, oldlen + 2);
+    jl_gc_unsafe_leave(ptls, gc_state);
+}
+
+STATIC_INLINE void gc_add_ptr_finalizer(jl_tls_states_t *ptls,
+                                        jl_value_t *v, void *f)
+{
+    gc_add_finalizer_(ptls, (void*)(((uintptr_t)v) | 1), f);
+}
+
+JL_DLLEXPORT void jl_gc_add_finalizer_th(jl_tls_states_t *ptls,
+                                         jl_value_t *v, jl_function_t *f)
+{
+    if (__unlikely(jl_typeis(f, jl_voidpointer_type))) {
+        gc_add_ptr_finalizer(ptls, v, jl_unbox_voidpointer(f));
+    }
+    else {
+        gc_add_finalizer_(ptls, v, f);
+    }
 }
 
 JL_DLLEXPORT void jl_gc_add_finalizer(jl_value_t *v, jl_function_t *f)
 {
-    JL_LOCK_NOGC(&finalizers_lock);
-    if (__unlikely(jl_typeis(f, jl_voidpointer_type))) {
-        gc_add_ptr_finalizer(v, jl_unbox_voidpointer(f));
-    }
-    else {
-        arraylist_push(&finalizer_list, v);
-        arraylist_push(&finalizer_list, f);
-    }
-    JL_UNLOCK_NOGC(&finalizers_lock);
+    jl_tls_states_t *ptls = jl_get_ptls_states();
+    jl_gc_add_finalizer_th(ptls, v, f);
 }
 
-JL_DLLEXPORT void jl_gc_add_ptr_finalizer(jl_value_t *v, void *f)
+JL_DLLEXPORT void jl_gc_add_ptr_finalizer(jl_tls_states_t *ptls,
+                                          jl_value_t *v, void *f)
 {
-    JL_LOCK_NOGC(&finalizers_lock);
-    gc_add_ptr_finalizer(v, f);
-    JL_UNLOCK_NOGC(&finalizers_lock);
+    gc_add_ptr_finalizer(ptls, v, f);
 }
 
 JL_DLLEXPORT void jl_finalize(jl_value_t *o)
 {
+    jl_tls_states_t *ptls = jl_get_ptls_states();
     JL_LOCK_NOGC(&finalizers_lock);
     // Copy the finalizers into a temporary list so that code in the finalizer
     // won't change the list as we loop through them.
@@ -255,8 +302,11 @@ JL_DLLEXPORT void jl_finalize(jl_value_t *o)
     arraylist_push(&copied_list, NULL); // pgcstack to be filled later
     // No need to check the to_finalize list since the user is apparently
     // still holding a reference to the object
-    finalize_object(&finalizer_list, o, &copied_list);
-    finalize_object(&finalizer_list_marked, o, &copied_list);
+    for (int i = 0;i < jl_n_threads;i++) {
+        jl_tls_states_t *ptls2 = jl_all_tls_states[i];
+        finalize_object(&ptls2->finalizers, o, &copied_list, ptls != ptls2);
+    }
+    finalize_object(&finalizer_list_marked, o, &copied_list, 0);
     if (copied_list.len > 2) {
         // This releases the finalizers lock.
         jl_gc_run_finalizers_in_list(&copied_list);
@@ -497,7 +547,8 @@ static inline int maybe_collect(void)
         jl_gc_collect(0);
         return 1;
     }
-    jl_gc_safepoint();
+    jl_tls_states_t *ptls = jl_get_ptls_states();
+    jl_gc_safepoint_(ptls);
     return 0;
 }
 
@@ -732,6 +783,7 @@ static NOINLINE void add_page(jl_gc_pool_t *p)
 static inline jl_taggedvalue_t *__pool_alloc(jl_gc_pool_t *p, int osize,
                                              int end_offset)
 {
+    jl_tls_states_t *ptls = jl_get_ptls_states();
 #ifdef MEMDEBUG
     return alloc_big(osize);
 #endif
@@ -743,7 +795,7 @@ static inline jl_taggedvalue_t *__pool_alloc(jl_gc_pool_t *p, int osize,
         //gc_num.allocd += osize;
     }
     else {
-        jl_gc_safepoint();
+        jl_gc_safepoint_(ptls);
     }
     gc_num.poolalloc++;
     // first try to use the freelist
@@ -1262,6 +1314,8 @@ void gc_mark_object_list(arraylist_t *list, size_t start)
 {
     for (size_t i = start;i < list->len;i++) {
         void *v = list->items[i];
+        if (__unlikely(!v))
+            continue;
         if (gc_ptr_tag(v, 1)) {
             v = gc_ptr_clear_tag(v, 1);
             i++;
@@ -1517,6 +1571,17 @@ static void post_mark(arraylist_t *list)
         void *v0 = list->items[i];
         int is_cptr = gc_ptr_tag(v0, 1);
         void *v = gc_ptr_clear_tag(v0, 1);
+        if (__unlikely(!v0)) {
+            // remove from this list
+            if (i < list->len - 2) {
+                list->items[i] = list->items[list->len - 2];
+                list->items[i + 1] = list->items[list->len - 1];
+                i -= 2;
+            }
+            list->len -= 2;
+            continue;
+        }
+
         void *fin = list->items[i+1];
         int isfreed = !gc_marked(jl_astaggedvalue(v)->bits.gc);
         int isold = (list != &finalizer_list_marked &&
@@ -1525,8 +1590,8 @@ static void post_mark(arraylist_t *list)
         if (isfreed || isold) {
             // remove from this list
             if (i < list->len - 2) {
-                list->items[i] = list->items[list->len-2];
-                list->items[i+1] = list->items[list->len-1];
+                list->items[i] = list->items[list->len - 2];
+                list->items[i + 1] = list->items[list->len - 1];
                 i -= 2;
             }
             list->len -= 2;
@@ -1564,7 +1629,7 @@ JL_DLLEXPORT int jl_gc_enable(int on)
         // enable -> disable
         jl_atomic_fetch_add(&jl_gc_disable_counter, 1);
         // check if the GC is running and wait for it to finish
-        jl_gc_safepoint();
+        jl_gc_safepoint_(ptls);
     }
     return prev;
 }
@@ -1656,12 +1721,18 @@ static void _jl_gc_collect(int full, char *stack_hi)
     // mark the object moved to the marked list from the
     // `finalizer_list` by `post_mark`
     size_t orig_marked_len = finalizer_list_marked.len;
-    post_mark(&finalizer_list);
+    for (int i = 0;i < jl_n_threads;i++) {
+        jl_tls_states_t *ptls2 = jl_all_tls_states[i];
+        post_mark(&ptls2->finalizers);
+    }
     if (prev_sweep_full) {
         post_mark(&finalizer_list_marked);
         orig_marked_len = 0;
     }
-    gc_mark_object_list(&finalizer_list, 0);
+    for (int i = 0;i < jl_n_threads;i++) {
+        jl_tls_states_t *ptls2 = jl_all_tls_states[i];
+        gc_mark_object_list(&ptls2->finalizers, 0);
+    }
     gc_mark_object_list(&finalizer_list_marked, orig_marked_len);
     // "Flush" the mark stack before flipping the reset_age bit
     // so that the objects are not incorrectly resetted.
@@ -1777,13 +1848,13 @@ JL_DLLEXPORT void jl_gc_collect(int full)
     char *stack_hi = (char*)gc_get_stack_ptr();
     gc_debug_print();
 
-    int8_t old_state = jl_gc_state();
+    int8_t old_state = jl_gc_state(ptls);
     ptls->gc_state = JL_GC_STATE_WAITING;
     // `jl_safepoint_start_gc()` makes sure only one thread can
     // run the GC.
     if (!jl_safepoint_start_gc()) {
         // Multithread only. See assertion in `safepoint.c`
-        jl_gc_state_set(old_state, JL_GC_STATE_WAITING);
+        jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
         return;
     }
     // no-op for non-threading
@@ -1797,7 +1868,7 @@ JL_DLLEXPORT void jl_gc_collect(int full)
 
     // no-op for non-threading
     jl_safepoint_end_gc();
-    jl_gc_state_set(old_state, JL_GC_STATE_WAITING);
+    jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
 
     // Only disable finalizers on current thread
     // Doing this on all threads is racy (it's impossible to check
@@ -1869,8 +1940,9 @@ JL_DLLEXPORT jl_value_t *jl_gc_alloc_3w(void)
 }
 
 // Per-thread initialization (when threading is fully implemented)
-void jl_mk_thread_heap(jl_thread_heap_t *heap)
+void jl_mk_thread_heap(jl_tls_states_t *ptls)
 {
+    jl_thread_heap_t *heap = &ptls->heap;
     const int *szc = sizeclasses;
     jl_gc_pool_t *p = heap->norm_pools;
     for(int i=0; i < JL_GC_N_POOLS; i++) {
@@ -1890,6 +1962,7 @@ void jl_mk_thread_heap(jl_thread_heap_t *heap)
     heap->last_remset = &heap->_remset[1];
     arraylist_new(heap->remset, 0);
     arraylist_new(heap->last_remset, 0);
+    arraylist_new(&ptls->finalizers, 0);
 }
 
 // System-wide initializations
@@ -1898,7 +1971,6 @@ void jl_gc_init(void)
     jl_gc_init_page();
     gc_debug_init();
 
-    arraylist_new(&finalizer_list, 0);
     arraylist_new(&finalizer_list_marked, 0);
     arraylist_new(&to_finalize, 0);
 
